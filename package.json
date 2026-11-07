@@ -1,0 +1,53 @@
+{
+  "name": "triple-tick",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Free, open-source, self-hosted team inbox for WhatsApp Business, with way more personality.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "dev": "concurrently -n api,web -c magenta,cyan \"npm:dev:api\" \"npm:dev:web\"",
+    "dev:api": "TT_DEMO=1 node --disable-warning=ExperimentalWarning --watch server/src/index.ts",
+    "dev:web": "vite web",
+    "build": "vite build web",
+    "start": "node --disable-warning=ExperimentalWarning server/src/index.ts",
+    "demo": "npm run build && TT_DEMO=1 npm start",
+    "test": "node --disable-warning=ExperimentalWarning --test \"server/test/*.test.ts\" \"web/test/*.test.ts\"",
+    "e2e": "node e2e/smoke.mjs",
+    "typecheck": "tsc --noEmit -p server && tsc --noEmit -p web"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.5.0",
+    "@fastify/static": "^10.1.10",
+    "@fontsource/atkinson-hyperlegible": "^5.3.0",
+    "@fontsource/bangers": "^5.3.0",
+    "@fontsource/caveat": "^5.3.0",
+    "@fontsource/fraunces": "^5.3.0",
+    "@fontsource/fredoka": "^5.3.0",
+    "@fontsource/inter": "^5.3.0",
+    "@fontsource/jetbrains-mono": "^5.3.0",
+    "@fontsource/press-start-2p": "^5.3.0",
+    "@fontsource/space-grotesk": "^5.3.0",
+    "@xyflow/react": "^12.12.1",
+    "fastify": "^5.12.8",
+    "qrcode": "^1.5.4",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "web-push": "^3.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/qrcode": "^1.5.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@types/web-push": "^3.6.4",
+    "@vitejs/plugin-react": "^6.2.1",
+    "concurrently": "^10.0.6",
+    "playwright": "^1.64.1",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5"
+  }
+}

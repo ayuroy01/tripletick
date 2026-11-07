@@ -1,0 +1,11 @@
+services:
+  tripletick:
+    build: .
+    restart: unless-stopped
+    ports: ["4310:4310"]
+    environment:
+      TT_PUBLIC_URL: ${TT_PUBLIC_URL:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    volumes: ["tripletick-data:/data"]
+volumes:
+  tripletick-data:
