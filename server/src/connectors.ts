@@ -232,7 +232,7 @@ export function registerConnectorRoutes(app: FastifyInstance) {
     if (b.type === 'zoho' && !ZOHO_REGIONS.includes(String(settings.region))) fail(400, 'Unknown Zoho region');
     if (b.type === 'inbound') settings.token = randomBytes(24).toString('base64url');
     const id = insert('INSERT INTO connectors(type, name, config, created_at) VALUES(?, ?, ?, ?)', b.type, String(b.name || b.type), sealSecret(JSON.stringify(settings)), Date.now());
-    audit(req.user.id, 'connectors.create', b.type);
+    audit(req.user, 'connectors.create', b.type);
     const path = b.type === 'inbound' ? `/hooks/in/${settings.token}` : b.type === 'shopify' ? `/hooks/shopify/${id}` : undefined;
     return { id, path };
   });
@@ -246,7 +246,7 @@ export function registerConnectorRoutes(app: FastifyInstance) {
 
   app.delete('/api/connectors/:id', { preHandler: admins }, (req) => {
     run('DELETE FROM connectors WHERE id = ?', Number((req.params as any).id));
-    audit(req.user.id, 'connectors.delete');
+    audit(req.user, 'connectors.delete');
     return { ok: true };
   });
 

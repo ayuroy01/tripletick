@@ -7,7 +7,7 @@ import { callAction, type ParsedCall, type WhatsAppConfig } from './channels/wha
 import { all, audit, get, insert, run, tx } from './db.ts';
 import { publish } from './events.ts';
 import { anyone, fail, leads } from './http.ts';
-import { addSystemNote, ensureConversation, normalizePhone, send, SendBlocked, upsertContact } from './messaging.ts';
+import { addSystemNote, ensureConversation, hasConsent, normalizePhone, send, SendBlocked, upsertContact } from './messaging.ts';
 import { maskPhone, masks, seeConversation } from './routes.ts';
 
 const RING_MS = 60e3;
@@ -141,9 +141,13 @@ export function registerCallRoutes(app: FastifyInstance) {
     const id = seeConversation(req);
     const { sdp } = req.body as any;
     if (!sdp) fail(400, 'Missing call offer');
-    const conv = get<{ channel_id: number; phone: string }>('SELECT c.channel_id, k.phone FROM conversations c JOIN contacts k ON k.id = c.contact_id WHERE c.id = ?', id)!;
+    const conv = get<{ channel_id: number; phone: string; opted_out_at: number | null }>(
+      'SELECT c.channel_id, k.phone, k.opted_out_at FROM conversations c JOIN contacts k ON k.id = c.contact_id WHERE c.id = ?', id,
+    )!;
     const channel = getChannel(conv.channel_id)!;
     if (!channel.enabled) fail(422, 'This channel is disabled');
+    // A STOP covers calls too. Meta's own call permission is checked separately on WhatsApp.
+    if (conv.opted_out_at) throw new SendBlocked('consent_required', 'This customer replied STOP, so calls are off.');
     if (get("SELECT 1 FROM calls WHERE conversation_id = ? AND status != 'ended'", id)) fail(409, 'There is already a call on this chat');
     let externalId = `simcall_${randomUUID()}`;
     if (channel.type === 'whatsapp_cloud') {
@@ -162,7 +166,7 @@ export function registerCallRoutes(app: FastifyInstance) {
       id, externalId, req.user.id, String(sdp), Date.now(),
     );
     addSystemNote(id, `📞 ${req.user.name} is calling`);
-    audit(req.user.id, 'calls.start', `conversation:${id}`);
+    audit(req.user, 'calls.start', `conversation:${id}`);
     publish({ type: 'call', id: callId });
     return { id: callId };
   });
@@ -253,7 +257,7 @@ export function registerCallRoutes(app: FastifyInstance) {
       for (const c of audience) insert('INSERT INTO call_list_items(list_id, contact_id) VALUES(?, ?)', listId, c.id);
       return listId;
     });
-    audit(req.user.id, 'call_lists.create', String(id));
+    audit(req.user, 'call_lists.create', String(id));
     return { id, size: audience.length };
   });
 
@@ -268,9 +272,10 @@ export function registerCallRoutes(app: FastifyInstance) {
       for (;;) {
         const item = get<any>("SELECT * FROM call_list_items WHERE list_id = ? AND state = 'pending' ORDER BY id LIMIT 1", list.id);
         if (!item) return { done: true };
-        // Re-checked at dial time: they may have opted out since the list was built.
-        if (get<{ o: number | null }>('SELECT opted_out_at o FROM contacts WHERE id = ?', item.contact_id)?.o) {
-          run("UPDATE call_list_items SET state = 'done', outcome = 'opted_out' WHERE id = ?", item.id);
+        // Re-checked at dial time: consent may have changed since the list was built.
+        const k = get<{ opted_in: number; opted_out_at: number | null }>('SELECT opted_in, opted_out_at FROM contacts WHERE id = ?', item.contact_id);
+        if (!k || !hasConsent(k)) {
+          run("UPDATE call_list_items SET state = 'done', outcome = ? WHERE id = ?", k?.opted_out_at ? 'opted_out' : 'no_opt_in', item.id);
           continue;
         }
         run("UPDATE call_list_items SET state = 'calling', user_id = ? WHERE id = ?", req.user.id, item.id);

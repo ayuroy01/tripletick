@@ -1,5 +1,5 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
-import { userFromApiKey, userFromSession, type Role, type User } from './auth.ts';
+import { scopeAllows, userFromApiKey, userFromSession, type Role, type User } from './auth.ts';
 import { config } from './config.ts';
 
 declare module 'fastify' {
@@ -36,6 +36,8 @@ function authenticate(req: FastifyRequest) {
 export const need = (...roles: Role[]) => async (req: FastifyRequest) => {
   authenticate(req);
   if (roles.length && !roles.includes(req.user.role)) fail(403, "You don't have permission to do that");
+  const key = req.user.apiKey;
+  if (key && !scopeAllows(key.scopes, req.method, req.routeOptions.url ?? '')) fail(403, `This API key doesn't have permission for ${req.method} ${req.routeOptions.url}`);
 };
 export const anyone = need();
 export const leads = need('admin', 'manager');
