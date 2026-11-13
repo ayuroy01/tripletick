@@ -26,6 +26,27 @@ export const normalizePhone = (raw: string) => {
 export const windowOpen = (c: { last_inbound_at: number | null }, now = Date.now()) =>
   !!c.last_inbound_at && now - c.last_inbound_at < SESSION_WINDOW_MS;
 
+/** A customer who opted in and hasn't since said STOP. Only the customer can change the second part. */
+export const hasConsent = (k: { opted_in: number; opted_out_at: number | null }) => !!k.opted_in && !k.opted_out_at;
+
+/**
+ * Why a template may not go to this contact, or null when it may. Marketing always needs
+ * consent. Any template that opens a conversation (the window is closed) needs it too,
+ * so only replies inside an open window can skip it, and only for utility or login codes.
+ */
+export function templateConsentProblem(
+  contact: { opted_in: number; opted_out_at: number | null; last_inbound_at: number | null }, category: string, now = Date.now(),
+): string | null {
+  if (hasConsent(contact)) return null;
+  if (String(category).toUpperCase() === 'MARKETING') {
+    return contact.opted_out_at ? 'This customer replied STOP, so marketing messages are off.' : "This customer hasn't opted in to marketing messages.";
+  }
+  if (!windowOpen(contact, now)) {
+    return contact.opted_out_at ? 'This customer replied STOP. Wait for them to message you first.' : "This customer hasn't opted in, so you can't message them first.";
+  }
+  return null;
+}
+
 export function upsertContact(phone: string, name = ''): number {
   const p = normalizePhone(phone);
   if (!p) throw new Error('A valid phone number is required');
@@ -74,7 +95,7 @@ function stopBots(conversationId: number) {
   run("UPDATE bot_runs SET status = 'handoff', ended_at = ?, wake_at = NULL WHERE conversation_id = ? AND status IN ('waiting', 'sleeping')", Date.now(), conversationId);
 }
 
-export function assign(conversationId: number, userId: number | null, actorId: number | null = null) {
+export function assign(conversationId: number, userId: number | null, actor: Parameters<typeof audit>[0] = null) {
   run('UPDATE conversations SET assignee_id = ? WHERE id = ?', userId, conversationId);
   if (userId) {
     run('UPDATE users SET last_assigned_at = ? WHERE id = ?', Date.now(), userId);
@@ -82,7 +103,7 @@ export function assign(conversationId: number, userId: number | null, actorId: n
   }
   const name = userId ? get<{ name: string }>('SELECT name FROM users WHERE id = ?', userId)?.name : null;
   addSystemNote(conversationId, name ? `Assigned to ${name}` : 'Unassigned');
-  audit(actorId, 'conversation.assign', `conversation:${conversationId} -> ${userId}`);
+  audit(actor, 'conversation.assign', `conversation:${conversationId} -> ${userId}`);
   publish({ type: 'conversation', id: conversationId });
 }
 
@@ -139,13 +160,19 @@ export async function receiveInbound(m: Inbound): Promise<{ conversationId: numb
   if (answers) {
     m.body = `📋 Form submitted\n${Object.entries(answers).map(([k, v]) => `${k.replaceAll('_', ' ')}: ${v}`).join('\n')}`;
     m.payload = { ...m.payload, answers };
+  }
+  // The unique index is the real guard against a retried webhook: nothing below runs twice.
+  const inserted = run(
+    `INSERT INTO messages(conversation_id, direction, kind, body, payload, status, external_id, via, created_at) VALUES(?, 'in', ?, ?, ?, 'read', ?, 'customer', ?)
+     ON CONFLICT(external_id) WHERE external_id IS NOT NULL DO NOTHING`,
+    conversationId, kind, m.body, JSON.stringify(m.payload ?? {}), m.externalId ?? null, now,
+  );
+  if (!inserted.changes) return null;
+  const messageId = Number(inserted.lastInsertRowid);
+  if (answers) {
     const c = get<{ fields: string }>('SELECT fields FROM contacts WHERE id = ?', contactId)!;
     run('UPDATE contacts SET fields = ? WHERE id = ?', JSON.stringify({ ...parse(c.fields, {}), ...answers }), contactId);
   }
-  const messageId = insert(
-    "INSERT INTO messages(conversation_id, direction, kind, body, payload, status, external_id, via, created_at) VALUES(?, 'in', ?, ?, ?, 'read', ?, 'customer', ?)",
-    conversationId, kind, m.body, JSON.stringify(m.payload ?? {}), m.externalId ?? null, now,
-  );
 
   // The third tick: a reply means every outbound message before it got a real reaction.
   const acted = all<{ id: number }>(
@@ -218,7 +245,7 @@ export function renderTemplate(t: { body: string; variables: string }, contact: 
 /** Every outbound message goes through here, so the policy rules can't be bypassed. */
 export async function send(conversationId: number, draft: Draft, opts: SendOpts = {}): Promise<number> {
   const c = get<any>(
-    'SELECT c.*, k.phone, k.name, k.email, k.fields FROM conversations c JOIN contacts k ON k.id = c.contact_id WHERE c.id = ?', conversationId,
+    'SELECT c.*, k.phone, k.name, k.email, k.fields, k.opted_in, k.opted_out_at FROM conversations c JOIN contacts k ON k.id = c.contact_id WHERE c.id = ?', conversationId,
   );
   if (!c) throw new SendBlocked('not_found', 'Conversation not found');
   const channel = getChannel(c.channel_id);
@@ -247,6 +274,8 @@ export async function send(conversationId: number, draft: Draft, opts: SendOpts 
     const t = get<any>('SELECT * FROM templates WHERE id = ?', draft.templateId);
     if (!t) throw new SendBlocked('not_found', 'Template not found');
     if (t.status !== 'APPROVED') throw new SendBlocked('template_not_approved', 'Only approved templates can be sent');
+    const problem = templateConsentProblem(c, t.category);
+    if (problem) throw new SendBlocked('consent_required', problem);
     const r = renderTemplate(t, c);
     body = r.text;
     payload = { template: t.name, header: t.header, footer: t.footer, buttons: parse(t.buttons, []) };

@@ -89,6 +89,26 @@ CREATE TABLE IF NOT EXISTS vault (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS achievements (user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, key TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY(user_id, key));
 `;
 
+/**
+ * Ordered schema changes. Each runs once, in a transaction, and PRAGMA user_version
+ * records how many have run. Never edit or reorder a shipped entry: append a new one.
+ * The first entry is the original schema. It only creates what's missing, so
+ * databases from before migrations existed (user_version 0) upgrade cleanly.
+ */
+export const MIGRATIONS: string[] = [
+  SCHEMA,
+  // Meta retries webhooks, so an inbound message id must be stored at most once.
+  `UPDATE messages SET external_id = NULL WHERE external_id IS NOT NULL
+     AND id NOT IN (SELECT MIN(id) FROM messages WHERE external_id IS NOT NULL GROUP BY external_id);
+   DROP INDEX IF EXISTS idx_msg_ext;
+   CREATE UNIQUE INDEX idx_msg_ext ON messages(external_id) WHERE external_id IS NOT NULL;`,
+  // Scoped API keys. Existing keys keep full access until an admin narrows them.
+  `ALTER TABLE api_keys ADD COLUMN scopes TEXT NOT NULL DEFAULT '["admin"]';
+   ALTER TABLE api_keys ADD COLUMN expires_at INTEGER;
+   ALTER TABLE api_keys ADD COLUMN created_by INTEGER REFERENCES users(id);
+   ALTER TABLE audit_log ADD COLUMN api_key_id INTEGER;`,
+];
+
 let db: DatabaseSync | undefined;
 
 export function openDb(path: string): DatabaseSync {
@@ -96,8 +116,21 @@ export function openDb(path: string): DatabaseSync {
   db?.close();
   db = new DatabaseSync(path);
   db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
-  db.exec(SCHEMA);
+  migrate();
   return db;
+}
+
+export const schemaVersion = () => Number((conn().prepare('PRAGMA user_version').get() as { user_version: number }).user_version);
+
+function migrate() {
+  const from = schemaVersion();
+  if (from > MIGRATIONS.length) throw new Error(`This database is from a newer Triple Tick (schema ${from}). Upgrade the app instead of downgrading.`);
+  for (let v = from; v < MIGRATIONS.length; v++) {
+    tx(() => {
+      conn().exec(MIGRATIONS[v]);
+      conn().exec(`PRAGMA user_version = ${v + 1}`);
+    });
+  }
 }
 
 function conn(): DatabaseSync {
@@ -137,6 +170,8 @@ export const DEFAULT_SETTINGS = {
   sla_minutes: 15,
   auto_assign: true,
   mask_for_agents: true,
+  // Custom field keys that agents never see or change, such as an address or a date of birth.
+  sensitive_fields: [] as string[],
   block_agent_contact_sharing: true,
   ai_agent_enabled: false,
   ai_persona: 'Friendly, concise and helpful.',
@@ -159,6 +194,9 @@ export function setSetting(key: string, value: unknown) {
   run('INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', key, JSON.stringify(value));
 }
 
-export function audit(userId: number | null, action: string, target = '') {
-  run('INSERT INTO audit_log(user_id, action, target, at) VALUES(?, ?, ?, ?)', userId, action, target, Date.now());
+/** Records who did what. Pass the request's user so actions taken with an API key name the key. */
+export function audit(actor: number | null | { id: number; apiKey?: { id: number } }, action: string, target = '') {
+  const userId = typeof actor === 'object' && actor ? actor.id : actor;
+  const keyId = typeof actor === 'object' && actor ? actor.apiKey?.id ?? null : null;
+  run('INSERT INTO audit_log(user_id, api_key_id, action, target, at) VALUES(?, ?, ?, ?, ?)', userId, keyId, action, target, Date.now());
 }

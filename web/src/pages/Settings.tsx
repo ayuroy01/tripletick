@@ -40,6 +40,10 @@ function Workspace() {
         <Toggle k="auto_assign" label="Auto-assign new chats (round robin)" />
         <Toggle k="mask_for_agents" label="Mask customer phone, email and card numbers from agents" />
         <Toggle k="block_agent_contact_sharing" label="Block agents from sharing their own contact details" />
+        <label>Sensitive contact fields, hidden from agents (comma separated)
+          <input defaultValue={(s.sensitive_fields ?? []).join(', ')} placeholder="address, date_of_birth"
+            onBlur={(e) => save({ sensitive_fields: e.target.value.split(',').map((x) => x.trim()).filter(Boolean) })} />
+        </label>
         <Toggle k="fun_mode" label="Fun mode: XP, badges, the Arena and confetti" />
       </section>
       <section className="card form">
@@ -244,17 +248,28 @@ function Team({ admin }: { admin: boolean }) {
   );
 }
 
+const KEY_SCOPES: [string, string][] = [
+  ['conversations:read', 'Read chats'], ['messages:send', 'Send messages'], ['contacts:read', 'Read contacts'],
+  ['contacts:write', 'Add and edit contacts'], ['broadcasts:write', 'Broadcasts'], ['admin', 'Full admin access'],
+];
+
 function Developers() {
   const { toast } = useApp();
   const { data: keys, refresh } = useData<any[]>(() => api.get('/api-keys'));
   const { data: hooks, refresh: refreshHooks } = useData<any[]>(() => api.get('/webhooks'));
   const [secret, setSecret] = useState<{ label: string; value: string }>();
-  const newKey = async () => {
-    const name = prompt('What is this key for?');
-    if (!name) return;
-    const r = await api.post('/api-keys', { name });
-    setSecret({ label: 'API key', value: r.key });
-    refresh();
+  const newKey = async (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    const form = e.currentTarget;
+    const f = new FormData(form);
+    try {
+      const r = await api.post('/api-keys', { name: f.get('name'), scopes: f.getAll('scopes'), expiresInDays: Number(f.get('expires') || 0) });
+      setSecret({ label: 'API key', value: r.key });
+      form.reset();
+      refresh();
+    } catch (err) {
+      toast((err as Error).message, 'error');
+    }
   };
   const addHook = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -272,9 +287,26 @@ function Developers() {
     <div className="grid-2">
       <section className="card form">
         <h3>API keys</h3>
-        <p className="muted small">Send as <code>Authorization: Bearer …</code> to any <code>/api</code> route.</p>
-        <button className="btn small" onClick={newKey}>New key</button>
-        <table><tbody>{keys?.map((k) => <tr key={k.id}><td>{k.name}</td><td><code>{k.prefix}…</code></td><td><button className="btn small danger" onClick={() => api.del(`/api-keys/${k.id}`).then(refresh)}>Revoke</button></td></tr>)}</tbody></table>
+        <p className="muted small">Send as <code>Authorization: Bearer …</code>. Give each key only the scopes it needs.</p>
+        <form className="form" onSubmit={newKey}>
+          <label>What is this key for?<input name="name" required placeholder="Zapier" /></label>
+          <fieldset className="row" style={{ border: 0, padding: 0, gap: 12, flexWrap: "wrap" }}>
+            <legend className="small">Scopes</legend>
+            {KEY_SCOPES.map(([scope, label]) => (
+              <label key={scope} className="row small"><input type="checkbox" name="scopes" value={scope} defaultChecked={scope === 'conversations:read'} style={{ width: 'auto' }} /> {label}</label>
+            ))}
+          </fieldset>
+          <label>Expires after (days, 0 for never)<input name="expires" type="number" min={0} defaultValue={90} /></label>
+          <button className="btn small">Create key</button>
+        </form>
+        <table><tbody>{keys?.map((k) => (
+          <tr key={k.id}>
+            <td>{k.name}{k.scopes?.includes('admin') && <span className="tag" title="Full access. Consider a narrower key.">full access</span>}</td>
+            <td><code>{k.prefix}…</code></td>
+            <td className="small muted">{k.scopes?.join(', ')}{k.expires_at ? ` · expires ${new Date(k.expires_at).toLocaleDateString()}` : ''}</td>
+            <td><button className="btn small danger" onClick={() => api.del(`/api-keys/${k.id}`).then(refresh)}>Revoke</button></td>
+          </tr>
+        ))}</tbody></table>
       </section>
       <section className="card form">
         <h3>Webhooks</h3>
@@ -298,7 +330,7 @@ function Audit() {
     <div className="card table-wrap">
       <table>
         <thead><tr><th>When</th><th>Who</th><th>Action</th><th>Target</th></tr></thead>
-        <tbody>{data?.map((a) => <tr key={a.id}><td>{new Date(a.at).toLocaleString()}</td><td>{a.user_name ?? 'System'}</td><td>{a.action}</td><td>{a.target}</td></tr>)}</tbody>
+        <tbody>{data?.map((a) => <tr key={a.id}><td>{new Date(a.at).toLocaleString()}</td><td>{a.api_key_name ? `${a.user_name} (API key: ${a.api_key_name})` : a.user_name ?? 'System'}</td><td>{a.action}</td><td>{a.target}</td></tr>)}</tbody>
       </table>
     </div>
   );

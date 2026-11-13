@@ -78,7 +78,7 @@ The software costs nothing, with no seat limits, no feature tiers and no paid pl
 
 **AI:** an agent that answers from your knowledge base and hands off when unsure, chat summaries, magic replies, and rewrite and translate. It uses Claude when you add a key.
 
-**Team and governance:** a reporting hierarchy with scoped visibility, SLA tracking, an audit log, masking of customer phone, email and card numbers, and blocking agents from sharing their own contact details.
+**Team and governance:** a reporting hierarchy with scoped visibility, SLA tracking, an audit log, masking of customer phone, email and card numbers, sensitive contact fields hidden from agents, agents limited to their own customers, and blocking agents from sharing their own contact details.
 
 **Analytics:** agent performance, topic and mood charts, campaign funnels, and CSV export.
 
@@ -133,6 +133,7 @@ These can't be switched off, because they keep your number from being banned and
 - Free-form messages are blocked outside WhatsApp's 24-hour window
 - Broadcasts need an approved template and reach only opted-in contacts
 - `STOP` opts a customer out, and only the customer's `START` undoes it
+- Every send path checks consent in one place: marketing templates need an opt-in, any message that opens a conversation needs one, and nothing marketing reaches someone who said `STOP`, whether it comes from an agent, a bot, a broadcast or the API
 - A frequency cap and rate limit apply to every broadcast
 - Call lists and cart reminders reach only consenting contacts, and Shopify's marketing checkbox can't override a `STOP`
 
@@ -142,13 +143,13 @@ These can't be switched off, because they keep your number from being banned and
 docker compose up -d --build
 ```
 
-Put it behind a reverse proxy that handles HTTPS. Never set `TT_DEMO` in production. See `.env.example` for all the options.
+Put it behind a reverse proxy that handles HTTPS. Database changes run automatically at startup, so upgrading is a rebuild. Back up `/data` first, because a database can't be opened by an older version after it's been upgraded. Never set `TT_DEMO` in production. See `.env.example` for all the options.
 
 Access tokens and signing secrets are encrypted with AES-256-GCM. Set `TT_SECRET_KEY`, or Triple Tick creates `secret.key` in the data folder. Back up your data, but keep the key apart from your database backups: anyone with both can read your tokens, and if you lose the key you'll need to re-enter them. Customer messages and contacts aren't encrypted by the app, so use disk encryption too.
 
 ## API
 
-Create a key in **Settings → Developers**. Keys have full admin access, so treat them like passwords.
+Create a key in **Settings → Developers** and give it only the scopes it needs: `conversations:read`, `messages:send`, `contacts:read`, `contacts:write`, `broadcasts:write` or `admin`. Keys can expire, stop working if their creator stops being an admin, and are named in the audit log. Treat them like passwords.
 
 ```bash
 curl -H "Authorization: Bearer tt_..." https://your-host/api/conversations
@@ -157,7 +158,7 @@ curl -X POST -H "Authorization: Bearer tt_..." -H "content-type: application/jso
   -d '{"body":"Hello!"}' https://your-host/api/conversations/1/messages
 ```
 
-Webhooks send `message.received`, `message.sent`, `message.status`, `sla.breached` and `conversion.created`. Verify `x-tripletick-signature`, which is `sha256=` plus the HMAC-SHA256 of the raw body with your signing secret.
+Webhooks can't point at private or internal addresses, and redirects aren't followed. If your receiver is on your own network, set `TT_ALLOW_PRIVATE_WEBHOOKS=1`. Webhooks send `message.received`, `message.sent`, `message.status`, `sla.breached` and `conversion.created`. Verify `x-tripletick-signature`, which is `sha256=` plus the HMAC-SHA256 of the raw body with your signing secret.
 
 ## Development
 

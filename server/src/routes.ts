@@ -6,8 +6,8 @@ import { admins, anyone, cookieToken, fail, HttpError, leads, setCookie } from '
 import { aiMode, magicReplies, rewrite, summarize } from './ai.ts';
 import { botJourney, overview, parseCsv, toCsv } from './analytics.ts';
 import {
-  canSeeConversation, createApiKey, createSession, destroySession, hashPassword, publicUser, teamIds,
-  verifyPassword, visibilityClause, type User,
+  API_SCOPES, canSeeConversation, createApiKey, createSession, destroySession, hashPassword, publicUser, teamIds,
+  verifyPassword, visibilityClause, type Scope, type User,
 } from './auth.ts';
 import { broadcastStats, launch, retarget, segmentContacts, type Rule } from './broadcasts.ts';
 import { channelConfig, getChannel, publicChannel, type Channel } from './channels/index.ts';
@@ -15,6 +15,7 @@ import { downloadMedia, fetchTemplates, parseWebhook, submitTemplate, verifySign
 import { config } from './config.ts';
 import { all, audit, DEFAULT_SETTINGS, get, getSettings, insert, parse, run, setSetting, tx } from './db.ts';
 import { publish, subscribe, type LiveEvent } from './events.ts';
+import { checkOutboundUrl } from './netguard.ts';
 import { sealSecret } from './secrets.ts';
 import { onCallEvent, onCallStatus } from './calls.ts';
 import { recordConversion } from './connectors.ts';
@@ -45,14 +46,53 @@ export const maskCards = (text: string) =>
 
 export const masks = (u: User) => u.role === 'agent' && getSettings().mask_for_agents;
 
+/** Field keys this user must not see. Agents never see sensitive fields, whatever the masking setting. */
+export const hiddenFields = (u: User) => new Set(u.role === 'agent' ? getSettings().sensitive_fields.map((k) => String(k).toLowerCase()) : []);
+const HIDDEN = '•••';
+
+function hideFields(u: User, fields: Record<string, unknown>) {
+  const hidden = hiddenFields(u);
+  if (!hidden.size) return fields;
+  return Object.fromEntries(Object.entries(fields).map(([k, v]) => [k, hidden.has(k.toLowerCase()) ? HIDDEN : v]));
+}
+
 function viewContact(u: User, c: any) {
-  const out = { ...c, tags: parse(c.tags, []), fields: parse(c.fields, {}) };
+  const out = { ...c, tags: parse(c.tags, []), fields: hideFields(u, parse(c.fields, {})) };
   if (masks(u)) { out.phone = maskPhone(c.phone); out.email = maskEmail(c.email); }
   return out;
 }
 
 function viewMessage(u: User, m: any) {
-  return { ...m, payload: parse(m.payload, {}), body: masks(u) ? maskCards(m.body) : m.body };
+  const payload = parse<Record<string, any>>(m.payload, {});
+  let body = masks(u) ? maskCards(m.body) : m.body;
+  const hidden = hiddenFields(u);
+  if (payload.answers && hidden.size) {
+    // Form answers are copied into the bubble text too, so hide them in both places.
+    payload.answers = hideFields(u, payload.answers);
+    body = String(body).split('\n').map((line: string) => {
+      const key = line.split(': ')[0].toLowerCase().replaceAll(' ', '_');
+      return line.includes(': ') && hidden.has(key) ? `${line.split(': ')[0]}: ${HIDDEN}` : line;
+    }).join('\n');
+  }
+  return { ...m, payload, body };
+}
+
+/**
+ * Who may see a contact: anyone who can see one of their chats. A contact with no chats yet
+ * belongs to nobody, like an unassigned chat, so the team can start one.
+ */
+export function contactVisibilityClause(u: User): { sql: string; params: number[] } {
+  if (u.role === 'admin') return { sql: '1 = 1', params: [] };
+  const v = visibilityClause(u);
+  return {
+    sql: `(NOT EXISTS (SELECT 1 FROM conversations c WHERE c.contact_id = k.id) OR EXISTS (SELECT 1 FROM conversations c WHERE c.contact_id = k.id AND ${v.sql}))`,
+    params: v.params,
+  };
+}
+
+function canSeeContact(u: User, contactId: number) {
+  const v = contactVisibilityClause(u);
+  return !!get(`SELECT 1 FROM contacts k WHERE k.id = ? AND ${v.sql}`, contactId, ...v.params);
 }
 
 function conversationRow(u: User, c: any) {
@@ -89,7 +129,7 @@ export function crud(app: FastifyInstance, path: string, table: string, cols: st
       `INSERT INTO ${table}(${names.join(',')}) VALUES(${names.map(() => '?').join(',')})`,
       ...used.map((c) => encode(b, c)), ...(hasCreated ? [Date.now()] : []),
     );
-    audit(req.user.id, `${table}.create`, String(id));
+    audit(req.user, `${table}.create`, String(id));
     return map(get(`SELECT * FROM ${table} WHERE id = ?`, id));
   });
   app.patch(`/api/${path}/:id`, { preHandler: guard }, (req) => {
@@ -97,13 +137,13 @@ export function crud(app: FastifyInstance, path: string, table: string, cols: st
     const id = Number((req.params as any).id);
     const used = cols.filter((c) => b[c] !== undefined);
     if (used.length) run(`UPDATE ${table} SET ${used.map((c) => `${c} = ?`).join(', ')} WHERE id = ?`, ...used.map((c) => encode(b, c)), id);
-    audit(req.user.id, `${table}.update`, String(id));
+    audit(req.user, `${table}.update`, String(id));
     return map(get(`SELECT * FROM ${table} WHERE id = ?`, id) ?? fail(404, 'Not found'));
   });
   app.delete(`/api/${path}/:id`, { preHandler: guard }, (req) => {
     const id = Number((req.params as any).id);
     run(`DELETE FROM ${table} WHERE id = ?`, id);
-    audit(req.user.id, `${table}.delete`, String(id));
+    audit(req.user, `${table}.delete`, String(id));
     return { ok: true };
   });
 }
@@ -266,7 +306,7 @@ export function registerRoutes(app: FastifyInstance) {
       const target = b.assigneeId === null ? null : Number(b.assigneeId);
       if (req.user.role === 'agent' && target !== null && target !== req.user.id) fail(403, 'Agents can only assign chats to themselves');
       if (req.user.role === 'manager' && target !== null && !teamIds(req.user.id).includes(target)) fail(403, 'That person is not on your team');
-      assign(id, target, req.user.id);
+      assign(id, target, req.user);
     }
     if (b.status === 'resolved') {
       run("UPDATE conversations SET status = 'resolved', resolved_at = ?, snooze_until = NULL WHERE id = ?", Date.now(), id);
@@ -307,31 +347,44 @@ export function registerRoutes(app: FastifyInstance) {
   app.get('/api/contacts', { preHandler: anyone }, (req) => {
     const q = (req.query as any).q as string | undefined;
     const like = `%${q ?? ''}%`;
+    const v = contactVisibilityClause(req.user);
     const rows = masks(req.user)
-      ? all('SELECT * FROM contacts WHERE name LIKE ? ORDER BY id DESC LIMIT 500', like)
-      : all('SELECT * FROM contacts WHERE name LIKE ? OR phone LIKE ? OR email LIKE ? ORDER BY id DESC LIMIT 500', like, like, like);
+      ? all(`SELECT * FROM contacts k WHERE k.name LIKE ? AND ${v.sql} ORDER BY k.id DESC LIMIT 500`, like, ...v.params)
+      : all(`SELECT * FROM contacts k WHERE (k.name LIKE ? OR k.phone LIKE ? OR k.email LIKE ?) AND ${v.sql} ORDER BY k.id DESC LIMIT 500`, like, like, like, ...v.params);
     return rows.map((c) => viewContact(req.user, c));
   });
 
   app.post('/api/contacts', { preHandler: anyone }, (req) => {
     const b = req.body as any;
+    const existed = get<{ id: number }>('SELECT id FROM contacts WHERE phone = ?', normalizePhone(String(b.phone ?? '')));
+    // Adding a number that belongs to someone else's customer must not reveal or change their details.
+    if (existed && !canSeeContact(req.user, existed.id)) return { id: existed.id, existing: true };
     const id = upsertContact(String(b.phone ?? ''), String(b.name ?? ''));
     // Adding someone who already exists must not wipe their details or override a STOP.
     run(
       "UPDATE contacts SET email = CASE WHEN ? != '' THEN ? ELSE email END, opted_in = CASE WHEN ? AND opted_out_at IS NULL THEN 1 ELSE opted_in END WHERE id = ?",
       String(b.email ?? ''), String(b.email ?? ''), b.optedIn ? 1 : 0, id,
     );
-    audit(req.user.id, 'contacts.create', String(id));
+    audit(req.user, 'contacts.create', String(id));
     return viewContact(req.user, get('SELECT * FROM contacts WHERE id = ?', id));
   });
 
   app.patch('/api/contacts/:id', { preHandler: anyone }, (req) => {
     const id = Number((req.params as any).id);
     const b = req.body as any;
+    if (!canSeeContact(req.user, id)) fail(404, 'Contact not found');
     const c = get<any>('SELECT * FROM contacts WHERE id = ?', id) ?? fail(404, 'Contact not found');
+    const stored = parse<Record<string, unknown>>(c.fields, {});
+    let fields = b.fields && typeof b.fields === 'object' ? b.fields as Record<string, unknown> : stored;
+    // Someone who can't see a sensitive field can't change or remove it either.
+    const hidden = hiddenFields(req.user);
+    if (hidden.size) {
+      fields = Object.fromEntries(Object.entries(fields).filter(([k]) => !hidden.has(k.toLowerCase())));
+      for (const [k, v] of Object.entries(stored)) if (hidden.has(k.toLowerCase())) fields[k] = v;
+    }
     run(
       'UPDATE contacts SET name = ?, tags = ?, fields = ?, email = ? WHERE id = ?',
-      b.name ?? c.name, JSON.stringify(b.tags ?? parse(c.tags, [])), JSON.stringify(b.fields ?? parse(c.fields, {})),
+      b.name ?? c.name, JSON.stringify(b.tags ?? parse(c.tags, [])), JSON.stringify(fields),
       masks(req.user) ? c.email : (b.email ?? c.email), id,
     );
     // Only the customer can undo a STOP, by replying START.
@@ -343,7 +396,7 @@ export function registerRoutes(app: FastifyInstance) {
   app.delete('/api/contacts/:id', { preHandler: leads }, (req) => {
     const id = Number((req.params as any).id);
     run('DELETE FROM contacts WHERE id = ?', id);
-    audit(req.user.id, 'contacts.delete', String(id));
+    audit(req.user, 'contacts.delete', String(id));
     return { ok: true };
   });
 
@@ -365,19 +418,21 @@ export function registerRoutes(app: FastifyInstance) {
         imported++;
       }
     });
-    audit(req.user.id, 'contacts.import', `${imported} rows`);
+    audit(req.user, 'contacts.import', `${imported} rows`);
     return { imported, skipped };
   });
 
   app.get('/api/contacts/export', { preHandler: leads }, (req, reply) => {
-    audit(req.user.id, 'contacts.export');
+    audit(req.user, 'contacts.export');
     const rows = all<any>('SELECT name, phone, email, tags, opted_in, opted_out_at FROM contacts').map((c) => ({ ...c, tags: parse<string[]>(c.tags, []).join(';') }));
     return reply.header('content-type', 'text/csv').header('content-disposition', 'attachment; filename="contacts.csv"').send(toCsv(rows));
   });
 
   app.post('/api/contacts/:id/conversation', { preHandler: anyone }, (req) => {
-    const { channelId } = req.body as any;
-    return { id: ensureConversation(Number((req.params as any).id), Number(channelId)) };
+    const contactId = Number((req.params as any).id);
+    const channel = getChannel(Number((req.body as any).channelId)) ?? fail(400, 'Pick a channel');
+    if (!canSeeContact(req.user, contactId)) fail(404, 'Contact not found');
+    return { id: ensureConversation(contactId, channel.id) };
   });
 
   // --- Templates ---
@@ -396,7 +451,7 @@ export function registerRoutes(app: FastifyInstance) {
     } else {
       run("UPDATE templates SET status = 'APPROVED' WHERE id = ?", id); // the simulator has no review queue
     }
-    audit(req.user.id, 'templates.submit', String(id));
+    audit(req.user, 'templates.submit', String(id));
     return viewTemplate(get('SELECT * FROM templates WHERE id = ?', id));
   });
 
@@ -437,7 +492,7 @@ export function registerRoutes(app: FastifyInstance) {
     const value = Number(b.value ?? 0);
     if (!Number.isFinite(value) || value < 0) fail(400, 'Enter a valid amount');
     const contact = get<{ contact_id: number }>('SELECT contact_id FROM conversations WHERE id = ?', id)!;
-    audit(req.user.id, 'conversions.create', `conversation:${id}`);
+    audit(req.user, 'conversions.create', `conversation:${id}`);
     return recordConversion({ conversationId: id, contactId: contact.contact_id, eventName: String(b.eventName || 'Purchase'), value, currency: String(b.currency || 'USD').toUpperCase(), source: 'agent' });
   });
 
@@ -470,7 +525,7 @@ export function registerRoutes(app: FastifyInstance) {
       b.name, Number(b.templateId), Number(b.channelId), b.segmentId ? Number(b.segmentId) : null,
       b.scheduledAt ? 'scheduled' : 'draft', b.scheduledAt ? Number(b.scheduledAt) : null, req.user.id, Date.now(),
     );
-    audit(req.user.id, 'broadcasts.create', String(id));
+    audit(req.user, 'broadcasts.create', String(id));
     if (!b.scheduledAt) { try { launch(id); } catch (e) { run('DELETE FROM broadcasts WHERE id = ?', id); fail(400, (e as Error).message); } }
     return { id };
   });
@@ -519,10 +574,13 @@ export function registerRoutes(app: FastifyInstance) {
   // --- Admin ---
   app.get('/api/settings', { preHandler: anyone }, () => getSettings());
   app.patch('/api/settings', { preHandler: admins }, (req) => {
-    for (const [k, v] of Object.entries(req.body as object)) {
-      if (k in DEFAULT_SETTINGS) setSetting(k, v);
+    const defaults = DEFAULT_SETTINGS as Record<string, unknown>;
+    const changes = Object.entries(req.body as object).filter(([k]) => k in defaults);
+    for (const [k, v] of changes) {
+      if (Array.isArray(defaults[k]) !== Array.isArray(v) || typeof defaults[k] !== typeof v || v === null) fail(400, `Invalid value for ${k}`);
     }
-    audit(req.user.id, 'settings.update');
+    for (const [k, v] of changes) setSetting(k, k === 'sensitive_fields' ? (v as unknown[]).map(String).filter(Boolean) : v);
+    audit(req.user, 'settings.update');
     return getSettings();
   });
 
@@ -539,7 +597,7 @@ export function registerRoutes(app: FastifyInstance) {
       'INSERT INTO users(name, email, phone, pass_hash, role, manager_id, created_at) VALUES(?, ?, ?, ?, ?, ?, ?)',
       b.name, b.email, b.phone ?? null, hashPassword(b.password), ['admin', 'manager', 'agent'].includes(b.role) ? b.role : 'agent', b.managerId ?? null, Date.now(),
     );
-    audit(req.user.id, 'users.create', String(id));
+    audit(req.user, 'users.create', String(id));
     return { id };
   });
 
@@ -554,7 +612,7 @@ export function registerRoutes(app: FastifyInstance) {
       b.role ?? u.role, b.managerId === undefined ? u.manager_id : b.managerId, b.active ?? u.active, b.phone ?? u.phone, id,
     );
     if (b.active === 0) run('DELETE FROM sessions WHERE user_id = ?', id);
-    audit(req.user.id, 'users.update', String(id));
+    audit(req.user, 'users.update', String(id));
     return { ok: true };
   });
 
@@ -565,7 +623,7 @@ export function registerRoutes(app: FastifyInstance) {
     const b = req.body as any;
     if (!['simulator', 'whatsapp_cloud'].includes(b.type)) fail(400, 'Unknown channel type');
     const id = insert('INSERT INTO channels(type, name, phone, config, created_at) VALUES(?, ?, ?, ?, ?)', b.type, String(b.name), String(b.phone ?? ''), sealSecret(JSON.stringify(b.config ?? {})), Date.now());
-    audit(req.user.id, 'channels.create', String(id));
+    audit(req.user, 'channels.create', String(id));
     return publicChannel(getChannel(id)!);
   });
 
@@ -576,28 +634,37 @@ export function registerRoutes(app: FastifyInstance) {
     const merged: Record<string, unknown> = { ...channelConfig(c) };
     for (const [k, v] of Object.entries(b.config ?? {})) if (v !== '' && typeof v === 'string') merged[k] = v; // blank keeps the stored secret
     run('UPDATE channels SET name = ?, phone = ?, enabled = ?, config = ? WHERE id = ?', b.name ?? c.name, b.phone ?? c.phone, b.enabled ?? c.enabled, sealSecret(JSON.stringify(merged)), id);
-    audit(req.user.id, 'channels.update', String(id));
+    audit(req.user, 'channels.update', String(id));
     return publicChannel(getChannel(id)!);
   });
 
-  app.get('/api/api-keys', { preHandler: admins }, () => all('SELECT id, name, prefix, created_at, last_used_at FROM api_keys ORDER BY id DESC'));
+  app.get('/api/api-keys', { preHandler: admins }, () =>
+    all('SELECT id, name, prefix, scopes, expires_at, created_at, last_used_at FROM api_keys ORDER BY id DESC').map((k: any) => ({ ...k, scopes: parse(k.scopes, []) })));
   app.post('/api/api-keys', { preHandler: admins }, (req) => {
-    audit(req.user.id, 'api_keys.create');
-    return createApiKey(String((req.body as any).name || 'API key'));
+    // A leaked key must not be able to mint a replacement that outlives its revocation.
+    if (req.user.apiKey) fail(403, 'API keys cannot create other API keys');
+    const b = req.body as any;
+    const scopes = Array.isArray(b.scopes) ? [...new Set(b.scopes.map(String))] : [];
+    if (!scopes.length || scopes.some((x) => !(API_SCOPES as readonly string[]).includes(x as string))) fail(400, `Pick at least one scope from: ${API_SCOPES.join(', ')}`);
+    const days = Number(b.expiresInDays ?? 0);
+    if (!Number.isFinite(days) || days < 0) fail(400, 'Expiry must be a number of days, or 0 for never');
+    const name = String(b.name || 'API key').slice(0, 80);
+    const created = createApiKey(name, scopes as Scope[], req.user.id, days ? Date.now() + days * 864e5 : null);
+    audit(req.user, 'api_keys.create', `${name} [${scopes.join(', ')}]`);
+    return created;
   });
   app.delete('/api/api-keys/:id', { preHandler: admins }, (req) => {
     run('DELETE FROM api_keys WHERE id = ?', Number((req.params as any).id));
-    audit(req.user.id, 'api_keys.delete');
+    audit(req.user, 'api_keys.delete');
     return { ok: true };
   });
 
   app.get('/api/webhooks', { preHandler: admins }, () => all('SELECT id, url, events, enabled, last_status FROM webhooks').map((w: any) => ({ ...w, events: parse(w.events, []) })));
-  app.post('/api/webhooks', { preHandler: admins }, (req) => {
+  app.post('/api/webhooks', { preHandler: admins }, async (req) => {
     const b = req.body as any;
-    const url = new URL(String(b.url));
-    if (!['http:', 'https:'].includes(url.protocol)) fail(400, 'Webhook URLs must use http or https');
+    const url = await checkOutboundUrl(String(b.url ?? '')).catch((e) => fail(400, e.message));
     const secret = randomBytes(24).toString('base64url');
-    audit(req.user.id, 'webhooks.create', url.host);
+    audit(req.user, 'webhooks.create', url.host);
     return { id: insert('INSERT INTO webhooks(url, secret, events) VALUES(?, ?, ?)', url.href, sealSecret(secret), JSON.stringify(b.events ?? ['*'])), secret };
   });
   app.delete('/api/webhooks/:id', { preHandler: admins }, (req) => {
@@ -606,7 +673,7 @@ export function registerRoutes(app: FastifyInstance) {
   });
 
   app.get('/api/audit', { preHandler: admins }, () =>
-    all('SELECT a.*, u.name user_name FROM audit_log a LEFT JOIN users u ON u.id = a.user_id ORDER BY a.id DESC LIMIT 200'));
+    all('SELECT a.*, u.name user_name, k.name api_key_name FROM audit_log a LEFT JOIN users u ON u.id = a.user_id LEFT JOIN api_keys k ON k.id = a.api_key_id ORDER BY a.id DESC LIMIT 200'));
 
   // --- Media ---
   app.post('/api/media', { preHandler: anyone }, (req) => {
@@ -679,6 +746,7 @@ export function registerRoutes(app: FastifyInstance) {
     for (const m of messages) {
       const channel = owners.find((c) => channelConfig<WhatsAppConfig>(c).phoneNumberId === m.phoneNumberId)!;
       const payload: Record<string, unknown> = {};
+      if (m.externalId && get('SELECT 1 FROM messages WHERE external_id = ?', m.externalId)) continue; // a retry: skip the download too
       if (m.mediaId) {
         const ext = MEDIA_TYPES[(m.mime ?? '').split(';')[0]];
         if (ext) {

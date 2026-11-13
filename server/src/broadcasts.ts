@@ -1,6 +1,6 @@
 import { all, get, getSettings, insert, parse, run, tx } from './db.ts';
 import { publish } from './events.ts';
-import { ensureConversation, send } from './messaging.ts';
+import { ensureConversation, hasConsent, send } from './messaging.ts';
 
 export interface Rule { field: string; op: string; value?: string }
 export interface Contact { id: number; name: string; phone: string; email: string; tags: string; fields: string; opted_in: number; opted_out_at: number | null; created_at: number }
@@ -83,9 +83,10 @@ export async function tickBroadcasts() {
     const pending = all<{ id: number; contact_id: number }>("SELECT id, contact_id FROM broadcast_recipients WHERE broadcast_id = ? AND state = 'pending' LIMIT ?", b.id, budget);
     for (const r of pending) {
       budget--;
-      // Re-checked at send time: the contact may have opted out since the audience froze.
-      if (get<{ o: number | null }>('SELECT opted_out_at o FROM contacts WHERE id = ?', r.contact_id)?.o) {
-        run("UPDATE broadcast_recipients SET state = 'skipped', reason = 'opted_out' WHERE id = ?", r.id);
+      // Re-checked at send time: consent may have changed since the audience froze.
+      const k = get<{ opted_in: number; opted_out_at: number | null }>('SELECT opted_in, opted_out_at FROM contacts WHERE id = ?', r.contact_id);
+      if (!k || !hasConsent(k)) {
+        run("UPDATE broadcast_recipients SET state = 'skipped', reason = ? WHERE id = ?", k?.opted_out_at ? 'opted_out' : 'no_opt_in', r.id);
         continue;
       }
       try {

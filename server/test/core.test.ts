@@ -44,8 +44,32 @@ describe('messaging rules', () => {
     await send(r!.conversationId, { kind: 'text', body: 'inside window' });
     run('UPDATE conversations SET last_inbound_at = ?', Date.now() - SESSION_WINDOW_MS - 1000);
     await assert.rejects(send(r!.conversationId, { kind: 'text', body: 'too late' }), { code: 'window_closed' });
+    run('UPDATE contacts SET opted_in = 1');
     const id = await send(r!.conversationId, { kind: 'template', templateId: approvedTemplate() });
     assert.equal(get<any>('SELECT body FROM messages WHERE id = ?', id).body, 'Hi Test');
+  });
+
+  it('never sends a marketing template after STOP, on any path', async () => {
+    const r = await receiveInbound({ channelId: channel, from: '+15550001', body: 'STOP' });
+    run('UPDATE contacts SET opted_in = 1'); // even a stale opt-in can't override a STOP
+    for (const via of ['agent', 'api', 'bot', 'system'] as const) {
+      await assert.rejects(send(r!.conversationId, { kind: 'template', templateId: approvedTemplate() }, { via }), { code: 'consent_required' });
+    }
+  });
+
+  it('needs an opt-in before a marketing template, even inside the window', async () => {
+    const r = await receiveInbound({ channelId: channel, from: '+15550001', body: 'hi' });
+    await assert.rejects(send(r!.conversationId, { kind: 'template', templateId: approvedTemplate() }), { code: 'consent_required' });
+  });
+
+  it('lets utility templates answer inside the window, but not open a conversation without consent', async () => {
+    const r = await receiveInbound({ channelId: channel, from: '+15550001', body: 'where is my order?' });
+    const utility = insert("INSERT INTO templates(name, category, body, status, created_at) VALUES('u', 'UTILITY', 'Order shipped', 'APPROVED', 0)");
+    await send(r!.conversationId, { kind: 'template', templateId: utility });
+    run('UPDATE conversations SET last_inbound_at = ?', Date.now() - SESSION_WINDOW_MS - 1000);
+    await assert.rejects(send(r!.conversationId, { kind: 'template', templateId: utility }), { code: 'consent_required' });
+    run('UPDATE contacts SET opted_in = 1');
+    await send(r!.conversationId, { kind: 'template', templateId: utility });
   });
 
   it('refuses unapproved templates', async () => {
@@ -188,6 +212,15 @@ describe('broadcasts', () => {
     run('UPDATE contacts SET opted_out_at = 1 WHERE id = ?', c);
     await tickBroadcasts();
     assert.equal(broadcastStats(b).sent, 0);
+  });
+
+  it('skips someone whose opt-in was removed after the audience froze', async () => {
+    const c = contact('+15550001', 1);
+    const b = create(approvedTemplate());
+    launch(b);
+    run('UPDATE contacts SET opted_in = 0 WHERE id = ?', c);
+    await tickBroadcasts();
+    assert.equal(get<any>('SELECT reason FROM broadcast_recipients WHERE broadcast_id = ?', b).reason, 'no_opt_in');
   });
 
   it('applies the frequency cap across broadcasts', async () => {
@@ -372,7 +405,7 @@ describe('access control', () => {
 
   it('accepts API keys and rejects bad ones', async () => {
     const admin = await login('demo@tripletick.local');
-    const { key } = (await api(admin, 'POST', '/api/api-keys', { name: 'zap' })).json();
+    const { key } = (await api(admin, 'POST', '/api/api-keys', { name: 'zap', scopes: ['contacts:read'] })).json();
     assert.equal((await app.inject({ url: '/api/contacts', headers: { authorization: `Bearer ${key}` } })).statusCode, 200);
     assert.equal((await app.inject({ url: '/api/contacts', headers: { authorization: 'Bearer nope' } })).statusCode, 401);
   });

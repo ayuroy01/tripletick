@@ -1,5 +1,6 @@
 import { createHmac } from 'node:crypto';
 import { all, parse, run } from './db.ts';
+import { postGuarded } from './netguard.ts';
 import { openSecret } from './secrets.ts';
 
 /**
@@ -36,13 +37,8 @@ export function emitWebhook(event: string, data: unknown) {
     const wanted = parse<string[]>(h.events, ['*']);
     if (!wanted.includes('*') && !wanted.includes(event)) continue;
     const body = JSON.stringify({ event, data, at: Date.now() });
-    fetch(h.url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-tripletick-signature': signPayload(openSecret(h.secret), body) },
-      body,
-      signal: AbortSignal.timeout(8000),
-    })
-      .then((r) => run('UPDATE webhooks SET last_status = ? WHERE id = ?', r.status, h.id))
+    postGuarded(h.url, body, { 'content-type': 'application/json', 'x-tripletick-signature': signPayload(openSecret(h.secret), body) })
+      .then((status) => run('UPDATE webhooks SET last_status = ? WHERE id = ?', status, h.id))
       .catch(() => run('UPDATE webhooks SET last_status = 0 WHERE id = ?', h.id));
   }
 }
